@@ -8,19 +8,39 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Query
+
 import os
 import shutil
 import uuid
 app = FastAPI(title="TinyLlama RAG API - Separate Endpoints")
 
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",  # Vite dev server
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],        # GET, POST, PUT, DELETE, OPTIONS
+    allow_headers=["*"],        # Authorization, Content-Type, etc.
+)
 # Global state
 CHROMA_PATH = "./chroma_db"
 embeddings = None
 vectorstore = None
 llm = None
 
+class HistoryRequest(BaseModel):
+    role: str
+    content: str
+
 class ChatRequest(BaseModel):
     message: str
+    history: list[HistoryRequest] = []
+    language:str
 
 class PDFResponse(BaseModel):
     status: str
@@ -32,7 +52,7 @@ async def startup_event():
     
     embeddings = OllamaEmbeddings(model="mxbai-embed-large")
     
-    llm = ChatOllama(model="tinyllama")
+    llm = ChatOllama(model="llama3.2")
     vectorstore = Chroma(
         persist_directory=CHROMA_PATH,
         embedding_function=embeddings
@@ -46,7 +66,6 @@ def store_in_bucket(temp_path: str, original_filename: str):
     document_id = str(uuid.uuid4())
     final_path = f"./uploads/{document_id}.pdf"
 
-    # Move temp file → uploads
     shutil.copy(temp_path, final_path)
 
     return {
@@ -109,33 +128,78 @@ async def chat(request: ChatRequest):
         relevant_docs = vectorstore.similarity_search(request.message, k=4)
         print(relevant_docs)
         context = "\n\n".join([doc.page_content for doc in relevant_docs])
-        
-        prompt_template = """Use ONLY the following context to answer the question. 
-            If the answer isn't in the context, say "I don't have that information".
+        history_text = "\n".join(f"{h.role}: {h.content}" for h in request.history)
+        prompt_template = """You are a helpful and accurate assistant.
+        Primary Rule:
+        - Use the provided context ONLY if it is clearly relevant to the user's question.
+        - If the context is irrelevant, partially relevant, or does not contain the required information, IGNORE it completely.
 
+        Context Usage Rules:
+        1. If the answer can be fully derived from the context, use it.
+        2. If the context does not contain the answer, respond using general, well-known, and correct information.
+        3. Never force an answer from the context if it does not logically apply to the question.
+        4. Do not mention the context explicitly in the final answer.
+
+        Conversation History Rules:
+        - Use conversation history only to understand intent or resolve ambiguity.
+        - Do not reuse outdated or unrelated information from history.
+
+        Answer Generation Rules:
+        - Answer strictly based on the user’s question.
+        - Ensure factual correctness and clarity.
+        - Do not hallucinate missing facts.
+        - Keep the answer concise but complete.
+        - Do not use emojis.
+        - Respond in the specified language using its native script.
+        LANGUAGE CONSTRAINT (MANDATORY):
+        - You MUST respond ONLY in {language}.
+        - Use ONLY native script of {language}.
+        - Do NOT mix languages.
+        - Do NOT translate names, code, or technical terms unless required.
+        Inputs:
         Context:
         {context}
 
-        Question: {question}
+        Conversation History:
+        {history}
 
-        Answer:"""
+        Question:
+        {question}
+
+        Output Language:
+        {language}
+
+        Final Instruction:
+        Generate the best possible answer for the user, following all rules above.
+
+        Answer:
+        """
         
         formatted_prompt = prompt_template.format(
             context=context,
-            question=request.message
-        )
-        
+            question=request.message,
+            history = "" ,
+            language = request.language
+        )# Add history = history_text
+        print(request.language)
         response = llm.invoke(formatted_prompt)
+        answer_text = response.content.strip()
+
+        # 🔹 Grounding check
+        in_context = not answer_text.lower().startswith("i don't have")
         pdf_page_list = []
 
-        for doc in relevant_docs:
-            pdf_path = doc.metadata.get("pdf_path")       # path to PDF
-            page_number = doc.metadata.get("page")  # or "page" if you stored numeric page
-            pdf_page_list.append([pdf_path, page_number])
+        pdf_page_list = [
+            {"pdf_path": doc.metadata.get("pdf_path"), "page": doc.metadata.get("page")}
+            for doc in relevant_docs
+        ]
+
         print(pdf_page_list)        
         return {
             "response": response.content,
             "context_chunks": len(relevant_docs),
+            "pdf_page_list":pdf_page_list,
+            "inContext":in_context
         }
     
     except Exception as e:
@@ -159,24 +223,24 @@ async def status():
         "llm_loaded": llm is not None
     }
 
-## === HTML UI ===
 @app.get("/", response_class=HTMLResponse)
 async def html_ui():
     return "Hello World"
 
-@app.get("/pdf/{doc_id}")
-def open_pdf(doc_id: str):
-    pdf_path = f"docs/{doc_id}.pdf"
+@app.get("/open-pdf")
+def open_pdf(
+    pdf_path: str = Query(...),
+):
+    if not os.path.exists(pdf_path):
+        raise HTTPException(status_code=404, detail="PDF not found")
 
     return FileResponse(
-        pdf_path,
+        path=pdf_path,
         media_type="application/pdf",
-        filename=f"{doc_id}.pdf",
         headers={
             "Content-Disposition": "inline"
         }
     )
-
     
 if __name__ == "__main__":
     import uvicorn
